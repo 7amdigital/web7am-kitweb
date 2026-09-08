@@ -35,7 +35,7 @@
  * ----------------------------------------------------------------------
  */
 
-const ALLOWED_ORIGIN = "https://tu-dominio.com"; // <-- reemplaza por tu dominio real
+const ALLOWED_ORIGIN = "https://web7am.com"; // <-- reemplaza por tu dominio real
 
 function corsHeaders() {
   return {
