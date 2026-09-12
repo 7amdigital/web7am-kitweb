@@ -7,7 +7,7 @@
  *        -> Disponibilidad real vía Cloudflare Registrar API.
  *
  *   POST /create-order
- *        body: { plan, priceValue, domainAddon, domain, domainMode, email }
+ *        body: { plan, priceValue, domainAddon, domain, domainMode, fullName, businessName, phone, email }
  *        -> Crea la orden en KV + un link de pago real en Bold.
  *        -> Devuelve { checkoutUrl, order_id }.
  *
@@ -29,13 +29,18 @@
  *   BOLD_API_KEY           Llave de identidad de Bold (Botón de pagos / Link de pago)
  *   BOLD_SECRET_KEY        Llave secreta de Bold (para verificar el webhook)
  *   SITE_ORIGIN            https://tu-dominio.com  (sin / al final)
+ *   N8N_WEBHOOK_URL        (opcional) URL del Webhook de n8n para notificarte
+ *                          cada venta. Si se deja vacío, simplemente no notifica.
+ *   N8N_WEBHOOK_SECRET     (opcional) valor propio que se envía en el header
+ *                          X-Notify-Secret, para que en n8n puedas verificar
+ *                          que la notificación viene realmente de este Worker.
  *
  * Binding de KV (Settings → Bindings → KV Namespace):
  *   Variable name: ORDERS
  * ----------------------------------------------------------------------
  */
 
-const ALLOWED_ORIGIN = "https://web7am.com"; // <-- reemplaza por tu dominio real
+const ALLOWED_ORIGIN = "https://tu-dominio.com"; // <-- reemplaza por tu dominio real
 
 function corsHeaders() {
   return {
@@ -59,6 +64,11 @@ function isValidDomain(domain) {
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isValidPhone(phone) {
+  const digits = phone.replace(/[\s-]/g, "");
+  return /^\+?[0-9]{7,15}$/.test(digits);
 }
 
 /* ============================================================
@@ -122,9 +132,15 @@ async function handleCreateOrder(request, env) {
   const domainAddon = Number(body.domainAddon) || 0;
   const domain = body.domain ? String(body.domain).toLowerCase().slice(0, 253) : null;
   const domainMode = body.domainMode === "new" || body.domainMode === "existing" ? body.domainMode : null;
+  const fullName = String(body.fullName || "").trim().slice(0, 120);
+  const businessName = String(body.businessName || "").trim().slice(0, 120);
+  const phone = String(body.phone || "").trim().slice(0, 30);
   const email = String(body.email || "").trim();
 
   if (!plan || priceValue <= 0) return json({ error: "invalid_plan" }, 400);
+  if (fullName.length < 3) return json({ error: "invalid_full_name" }, 400);
+  if (businessName.length < 2) return json({ error: "invalid_business_name" }, 400);
+  if (!isValidPhone(phone)) return json({ error: "invalid_phone" }, 400);
   if (!isValidEmail(email)) return json({ error: "invalid_email" }, 400);
   if (domainMode === "new" && (!domain || !isValidDomain(domain))) {
     return json({ error: "invalid_domain" }, 400);
@@ -175,6 +191,9 @@ async function handleCreateOrder(request, env) {
     total,
     domain: domain || null,
     domainMode,
+    fullName,
+    businessName,
+    phone,
     email,
     status: "pending",
     boldPaymentLinkId: boldData.payload.payment_link,
@@ -227,6 +246,47 @@ async function verifyBoldSignature(rawBody, secretKey, signature) {
   return timingSafeEqual(hex, signature);
 }
 
+/* ============================================================
+   Notificaciones a n8n (opcional)
+   ============================================================ */
+function buildNotifyPayload(order, eventName) {
+  return {
+    event: eventName,
+    order_id: order.order_id,
+    plan: order.plan,
+    priceValue: order.priceValue,
+    domainAddon: order.domainAddon,
+    total: order.total,
+    domain: order.domain,
+    domainMode: order.domainMode,
+    fullName: order.fullName || null,
+    businessName: order.businessName || null,
+    phone: order.phone || null,
+    email: order.email,
+    status: order.status,
+    boldTransactionId: order.boldTransactionId || null,
+    registrationState: order.registrationState || null,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+async function notifyN8n(order, eventName, env) {
+  if (!env.N8N_WEBHOOK_URL) return; // no configurado — se omite en silencio
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (env.N8N_WEBHOOK_SECRET) {
+      headers["X-Notify-Secret"] = env.N8N_WEBHOOK_SECRET;
+    }
+    await fetch(env.N8N_WEBHOOK_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(buildNotifyPayload(order, eventName)),
+    });
+  } catch (e) {
+    // una notificación fallida nunca debe romper el flujo del pedido
+  }
+}
+
 async function registerDomainAndUpdate(orderId, order, env) {
   try {
     const resp = await fetch(
@@ -266,6 +326,7 @@ async function registerDomainAndUpdate(orderId, order, env) {
   }
   order.updatedAt = Date.now();
   await env.ORDERS.put(`order:${orderId}`, JSON.stringify(order));
+  await notifyN8n(order, "domain_registration_result", env);
 }
 
 async function processApprovedSale(event, env) {
@@ -301,12 +362,15 @@ async function processApprovedSale(event, env) {
   const remaining = orderIds.filter((id) => id !== matchedId);
   await env.ORDERS.put(idxKey, JSON.stringify(remaining));
 
+  await notifyN8n(matchedOrder, "payment_approved", env);
+
   if (matchedOrder.domainMode === "new" && matchedOrder.domain) {
     await registerDomainAndUpdate(matchedId, matchedOrder, env);
   } else {
     matchedOrder.status = "completed";
     matchedOrder.updatedAt = Date.now();
     await env.ORDERS.put(`order:${matchedId}`, JSON.stringify(matchedOrder));
+    await notifyN8n(matchedOrder, "order_completed", env);
   }
 }
 
